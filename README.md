@@ -1,3 +1,9 @@
+<p>
+  <a href="https://www.nvidia.com/">
+    <img src="assets/nvidia-logo.svg" alt="NVIDIA" width="220">
+  </a>
+</p>
+
 # RETIRE: Handling LLM Agent Interruptions with Safe KV Cache Reuse
 
 [Paper](https://arxiv.org/abs/2610.01160) · [How it works](docs/agent-interruptions.md) · [vLLM integration](docs/vllm-integration.md) · [Citation](CITATION.cff)
