@@ -8,15 +8,15 @@
   </a>
 </p>
 
-# RETIRE: Handling LLM Agent Interruptions with Safe KV Cache Reuse
+# RETIRE: Versioned Execution for Interruptible LLM Agents
 
 [Paper](https://arxiv.org/abs/2610.01160) · [How it works](docs/agent-interruptions.md) · [vLLM integration](docs/vllm-integration.md) · [Citation](CITATION.cff)
 
-RETIRE handles **mid-execution interruptions and task revisions in LLM agent
-serving**. It prevents superseded executions from publishing stale output and
-lets revised executions inherit certified, still-valid KV-cache prefixes.
-Versioned execution coordinates cancellation, state handoff, and asynchronous
-cleanup across the serving lifecycle.
+RETIRE is a serving control plane for **LLM agent interruptions and
+mid-execution task revisions**. When an agent runtime replaces a running plan,
+RETIRE revokes the old execution's authority and coordinates the revised
+execution's takeover across output publication, in-flight computation, and
+state ownership.
 
 This repository contains the reference runtime, a deterministic CPU demo,
 protocol tests, and a research integration with vLLM.
@@ -32,11 +32,12 @@ Trivikram Krishnamurthy.
 A coding agent is implementing a new API. While generation is running, the user
 says: **“Keep the existing API; change only the implementation.”**
 
-The agent runtime chooses a revised plan. The serving system must then:
+User corrections, tool failures, or new observations can lead the agent runtime
+to replace live work. The serving system must make that interruption effective:
 
-- Stop delivering buffered output from the abandoned plan.
+- Revoke the abandoned execution's authority, including its buffered output.
 - Bound the obsolete work and isolate its remaining writes.
-- Reuse the shared repository-context prefix when it is safe to do so.
+- Hand the revised execution only state that satisfies its execution contract.
 - Start the revised execution while isolated old resources are reclaimed.
 
 RETIRE represents that handoff with an execution version. Requests own
@@ -51,6 +52,14 @@ flowchart LR
     D --> E[RESUME: start revised execution]
     E --> F[RECLAIM: release isolated old state]
 ```
+
+### Preserving useful work during the handoff
+
+Certified KV-cache inheritance is one mechanism for making the transition
+efficient: the revised execution can reuse a completed context prefix that
+remains valid. If the state cannot be certified, it recomputes under the new
+version. Old output still loses publication authority and old state remains
+isolated, whether or not reuse is possible.
 
 ## Try it locally
 

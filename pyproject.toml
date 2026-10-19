@@ -1,12 +1,12 @@
 [project]
 name = "retire-serving"
 version = "0.1.0"
-description = "Versioned execution for LLM agent interruptions and safe KV-cache handoff"
+description = "Versioned execution for LLM agent interruptions and mid-execution task revisions"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
 dependencies = []
-keywords = ["llm-serving", "agent-interruption", "kv-cache", "versioned-execution", "vllm"]
+keywords = ["agent-interruption", "llm-serving", "versioned-execution", "agent-serving", "vllm", "kv-cache"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.3,<10", "pytest-asyncio>=0.24,<2"]

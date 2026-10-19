@@ -7,8 +7,8 @@ are still in flight: buffered tokens, model execution, and writes to state
 that the next request might reuse.
 
 [RETIRE](../README.md) treats this event as a handoff between execution versions.
-It connects agent interruption handling to LLM serving and KV-cache management.
-The design is described in
+It makes the runtime's interruption decision effective across output
+publication, in-flight work, and state ownership. The design is described in
 [Serving a Revisable World: Versioned Execution for Interruptible Agents](https://arxiv.org/abs/2610.01160).
 
 ## A concrete mid-execution revision
@@ -21,12 +21,17 @@ The agent runtime decides which work to replace and supplies the revised token
 context. RETIRE starts at the serving boundary, where that decision must take
 effect across output, computation, and memory.
 
-Two costs can arise during abort-and-restart: waiting for obsolete computation
-to reach a stopping boundary, and recomputing a context prefix that remains
-useful. Correctness adds a separate obligation: an output that was buffered
-before cancellation must not become visible after its version loses authority.
+Once the runtime replaces the old plan, its buffered output and outstanding
+state writes must lose permission to affect the application or the successor.
+The successor must also be able to make progress while isolated obsolete work
+drains.
 
-## Why cancellation and prefix caching need coordination
+The transition can incur two costs: waiting for obsolete computation to reach
+a stopping boundary, and recomputing context that remains useful. Bounded
+retirement and certified state inheritance reduce these costs within the same
+version transition.
+
+## Making an interruption take effect across serving
 
 Cancellation tells a scheduler to stop work. It does not by itself prove that
 every buffered output has been discarded or every state writer has closed.
