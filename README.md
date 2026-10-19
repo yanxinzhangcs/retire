@@ -1,6 +1,10 @@
 <p>
   <a href="https://www.nvidia.com/">
-    <img src="assets/nvidia-logo.svg" alt="NVIDIA" width="220">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="assets/nvidia-logo-dark.svg">
+      <source media="(prefers-color-scheme: light)" srcset="assets/nvidia-logo.svg">
+      <img src="assets/nvidia-logo.svg" alt="NVIDIA" width="220">
+    </picture>
   </a>
 </p>
 
