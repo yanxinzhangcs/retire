@@ -1,0 +1,29 @@
+diff --git a/vllm/model_executor/models/gpt_oss.py b/vllm/model_executor/models/gpt_oss.py
+--- a/vllm/model_executor/models/gpt_oss.py
++++ b/vllm/model_executor/models/gpt_oss.py
+@@ -2,2 +2,3 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import os
+ from collections.abc import Iterable
+@@ -295,6 +296,21 @@ class GptOssModel(nn.Module):
+         aux_hidden_states = []
++        retire_layer_plan = None
++        if (
++            os.environ.get("RETIRE_LAYER_HORIZON")
++            and not self.aux_hidden_state_layers
++        ):
++            from retire_serving.epoch_mailbox import worker_layer_safe_point_plan
++
++            retire_layer_plan = worker_layer_safe_point_plan()
+         for i in range(self.start_layer, self.end_layer):
++            if (
++                retire_layer_plan is not None
++                and i > 0
++                and i % retire_layer_plan[0] == 0
++            ):
++                if retire_layer_plan[1]():
++                    break
+             layer = self.layers[i]
+             if i in self.aux_hidden_state_layers:
+                 aux_hidden_states.append(x if residual is None else x + residual)
+             x, residual = layer(x, positions, residual)

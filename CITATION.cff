@@ -1,0 +1,40 @@
+cff-version: 1.2.0
+message: "If you use RETIRE, please cite the accompanying paper."
+title: "RETIRE: Versioned Execution for Interruptible LLM Agents"
+type: software
+version: 0.1.0
+license: Apache-2.0
+repository-code: "https://github.com/yanxinzhangcs/retire"
+url: "https://arxiv.org/abs/2610.01160"
+authors:
+  - family-names: Zhang
+    given-names: Yanxin
+  - family-names: Sharma
+    given-names: Rahul
+  - family-names: Vegesna
+    given-names: Nitin
+  - family-names: Fu
+    given-names: Zheyu
+  - family-names: Liu
+    given-names: Chang
+  - family-names: Krishnamurthy
+    given-names: Trivikram
+preferred-citation:
+  type: article
+  title: "Serving a Revisable World: Versioned Execution for Interruptible Agents"
+  authors:
+    - family-names: Zhang
+      given-names: Yanxin
+    - family-names: Sharma
+      given-names: Rahul
+    - family-names: Vegesna
+      given-names: Nitin
+    - family-names: Fu
+      given-names: Zheyu
+    - family-names: Liu
+      given-names: Chang
+    - family-names: Krishnamurthy
+      given-names: Trivikram
+  journal: arXiv
+  year: 2026
+  url: "https://arxiv.org/abs/2610.01160"

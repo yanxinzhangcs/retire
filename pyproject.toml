@@ -1,0 +1,33 @@
+[project]
+name = "retire-serving"
+version = "0.1.0"
+description = "Versioned execution for LLM agent interruptions and safe KV-cache handoff"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+dependencies = []
+keywords = ["llm-serving", "agent-interruption", "kv-cache", "versioned-execution", "vllm"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3,<10", "pytest-asyncio>=0.24,<2"]
+
+[project.urls]
+Homepage = "https://github.com/yanxinzhangcs/retire"
+Paper = "https://arxiv.org/abs/2610.01160"
+Documentation = "https://github.com/yanxinzhangcs/retire/tree/main/docs"
+Issues = "https://github.com/yanxinzhangcs/retire/issues"
+
+[project.scripts]
+retire-serving-demo = "retire_serving.demo:main"
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/retire_serving"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+asyncio_mode = "auto"

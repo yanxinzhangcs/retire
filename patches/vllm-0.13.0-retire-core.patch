@@ -1,0 +1,1933 @@
+diff --git a/vllm/attention/ops/triton_reshape_and_cache_flash.py b/vllm/attention/ops/triton_reshape_and_cache_flash.py
+index 5d2ba15..9f58ca3 100644
+--- a/vllm/attention/ops/triton_reshape_and_cache_flash.py
++++ b/vllm/attention/ops/triton_reshape_and_cache_flash.py
+@@ -7,6 +7,18 @@ from vllm.platforms import current_platform
+ from vllm.triton_utils import tl, triton
+
+
++@triton.jit
++def _retire_volatile_load_u64(ptr):
++    return tl.inline_asm_elementwise(
++        asm="ld.global.volatile.u64 $0, [$1];",
++        constraints="=l,l",
++        args=[ptr],
++        dtype=tl.int64,
++        is_pure=False,
++        pack=1,
++    )
++
++
+ @triton.jit
+ def reshape_and_cache_kernel_flash(
+     key_ptr,  # [num_tokens, num_heads, head_size]
+@@ -14,6 +26,10 @@ def reshape_and_cache_kernel_flash(
+     key_cache_ptr,  # [num_blocks, block_size, num_heads, head_size]
+     value_cache_ptr,  # [num_blocks, block_size, num_heads, head_size]
+     slot_mapping_ptr,  # [num_tokens]
++    retire_epoch_table_ptr,  # [num_scope_slots]
++    retire_token_scope_slots_ptr,  # [num_tokens]
++    retire_token_expected_versions_ptr,  # [num_tokens]
++    retire_counters_ptr,  # [3]
+     k_scale,  # float32
+     v_scale,  # float32
+     # strides
+@@ -26,10 +42,24 @@ def reshape_and_cache_kernel_flash(
+     block_size: tl.constexpr,
+     # FP8 flags
+     FP8_KV_CACHE: tl.constexpr,
++    USE_RETIRE_EPOCH: tl.constexpr,
+     # tune parameters
+     TILE_SIZE: tl.constexpr,
+ ):
+     token_idx = tl.program_id(axis=0)
++    if USE_RETIRE_EPOCH:
++        scope_slot = tl.load(retire_token_scope_slots_ptr + token_idx)
++        if scope_slot >= 0:
++            expected_version = tl.load(
++                retire_token_expected_versions_ptr + token_idx
++            )
++            current_version = _retire_volatile_load_u64(
++                retire_epoch_table_ptr + scope_slot
++            )
++            if current_version != expected_version:
++                if tl.program_id(axis=1) == 0:
++                    tl.atomic_add(retire_counters_ptr + 1, 1)
++                return
+     slot_idx = tl.load(slot_mapping_ptr + token_idx).to(tl.int64)
+     if slot_idx < 0:
+         # Padding token that should be ignored.
+@@ -96,6 +126,10 @@ def triton_reshape_and_cache_flash(
+     kv_cache_dtype: str,  # "auto", "fp8"
+     k_scale: torch.Tensor,  # float32
+     v_scale: torch.Tensor,  # float32
++    retire_epoch_table: torch.Tensor | None = None,
++    retire_token_scope_slots: torch.Tensor | None = None,
++    retire_token_expected_versions: torch.Tensor | None = None,
++    retire_counters: torch.Tensor | None = None,
+ ):
+     num_heads = key.shape[1]
+     head_size = key.shape[2]
+@@ -159,12 +193,31 @@ def triton_reshape_and_cache_flash(
+         triton.cdiv(n, meta["TILE_SIZE"]),
+     )
+
++    use_retire_epoch = all(
++        item is not None
++        for item in (
++            retire_epoch_table,
++            retire_token_scope_slots,
++            retire_token_expected_versions,
++            retire_counters,
++        )
++    )
++    dummy = slot_mapping
++
+     reshape_and_cache_kernel_flash[grid](
+         key_ptr=key,
+         value_ptr=value,
+         key_cache_ptr=key_cache,
+         value_cache_ptr=value_cache,
+         slot_mapping_ptr=slot_mapping,
++        retire_epoch_table_ptr=(retire_epoch_table if use_retire_epoch else dummy),
++        retire_token_scope_slots_ptr=(
++            retire_token_scope_slots if use_retire_epoch else dummy
++        ),
++        retire_token_expected_versions_ptr=(
++            retire_token_expected_versions if use_retire_epoch else dummy
++        ),
++        retire_counters_ptr=(retire_counters if use_retire_epoch else dummy),
+         k_scale=k_scale,
+         v_scale=v_scale,
+         # strides
+@@ -177,6 +230,7 @@ def triton_reshape_and_cache_flash(
+         block_size=block_size,
+         # FP8 flags
+         FP8_KV_CACHE=FP8_KV_CACHE,
++        USE_RETIRE_EPOCH=use_retire_epoch,
+         # autotune parameters
+         TILE_SIZE=TILE_SIZE,
+         num_warps=num_warps,
+diff --git a/vllm/attention/ops/triton_unified_attention.py b/vllm/attention/ops/triton_unified_attention.py
+index f61c8e9..504cbb2 100644
+--- a/vllm/attention/ops/triton_unified_attention.py
++++ b/vllm/attention/ops/triton_unified_attention.py
+@@ -30,6 +30,18 @@ def apply_softcap(S, x):
+     return x * (p1 - p2) / (p1 + p2)
+
+
++@triton.jit
++def _retire_volatile_load_u64(ptr):
++    return tl.inline_asm_elementwise(
++        asm="ld.global.volatile.u64 $0, [$1];",
++        constraints="=l,l",
++        args=[ptr],
++        dtype=tl.int64,
++        is_pure=False,
++        pack=1,
++    )
++
++
+ @triton.jit
+ def find_seq_idx(
+     query_start_len_ptr,
+@@ -89,6 +101,10 @@ def kernel_unified_attention_2d(
+     USE_MM_PREFIX: tl.constexpr,  # bool
+     MAX_MM_RANGES: tl.constexpr,  # int
+     mm_prefix_range_ptr,  # [num_seqs] - prefix length for each sequence
++    retire_epoch_table_ptr,  # [num_scope_slots]
++    retire_seq_scope_slots_ptr,  # [num_seqs]
++    retire_seq_expected_versions_ptr,  # [num_seqs]
++    retire_counters_ptr,  # [3]
+     stride_k_cache_0: tl.int64,  # int
+     stride_k_cache_1: tl.int64,  # int
+     stride_k_cache_2: tl.int64,  # int
+@@ -102,6 +118,7 @@ def kernel_unified_attention_2d(
+     num_seqs: tl.int32,
+     BLOCK_M: tl.constexpr,  # int
+     USE_FP8: tl.constexpr,  # bool
++    USE_RETIRE_EPOCH: tl.constexpr,  # bool
+     FP8_MIN: tl.constexpr = float8_info.min,
+     FP8_MAX: tl.constexpr = float8_info.max,
+ ):
+@@ -112,6 +129,21 @@ def kernel_unified_attention_2d(
+         query_start_len_ptr, q_block_global_idx, num_seqs, BLOCK_Q, True
+     )
+
++    retire_scope_slot = -1
++    retire_expected_version = tl.full((), 0, tl.int64)
++    if USE_RETIRE_EPOCH:
++        retire_scope_slot = tl.load(retire_seq_scope_slots_ptr + seq_idx)
++        if retire_scope_slot >= 0:
++            retire_expected_version = tl.load(
++                retire_seq_expected_versions_ptr + seq_idx
++            )
++            retire_current_version = _retire_volatile_load_u64(
++                retire_epoch_table_ptr + retire_scope_slot
++            )
++            if retire_current_version != retire_expected_version:
++                tl.atomic_add(retire_counters_ptr, 1)
++                return
++
+     q_block_start_idx = tl.load(query_start_len_ptr + seq_idx) // BLOCK_Q + seq_idx
+
+     q_block_local_idx = q_block_global_idx - q_block_start_idx
+@@ -372,6 +419,15 @@ def kernel_unified_attention_2d(
+         + offs_d[None, :]
+     )
+
++    if USE_RETIRE_EPOCH:
++        if retire_scope_slot >= 0:
++            retire_current_version = _retire_volatile_load_u64(
++                retire_epoch_table_ptr + retire_scope_slot
++            )
++            if retire_current_version != retire_expected_version:
++                tl.atomic_add(retire_counters_ptr, 1)
++                return
++
+     tl.store(
+         output_ptr + output_offset,
+         acc,
+@@ -847,6 +903,10 @@ def unified_attention(
+     sinks=None,
+     # Optional tensor for prefix lengths (PrefixLM support)
+     mm_prefix_range=None,
++    retire_epoch_table=None,
++    retire_seq_scope_slots=None,
++    retire_seq_expected_versions=None,
++    retire_counters=None,
+ ):
+     assert causal, "Only causal attention is supported"
+     assert q_descale is None, "Q scales not supported"
+@@ -867,6 +927,16 @@ def unified_attention(
+
+     use_alibi_slopes = alibi_slopes is not None
+     use_qq_bias = qq_bias is not None
++    use_retire_epoch = all(
++        item is not None
++        for item in (
++            retire_epoch_table,
++            retire_seq_scope_slots,
++            retire_seq_expected_versions,
++            retire_counters,
++        )
++    )
++    retire_dummy = seqused_k
+
+     block_size = v.shape[1]
+     num_seqs = len(seqused_k)
+@@ -959,6 +1029,18 @@ def unified_attention(
+             USE_MM_PREFIX=use_mm_prefix,
+             MAX_MM_RANGES=max_mm_ranges,
+             mm_prefix_range_ptr=mm_prefix_range,
++            retire_epoch_table_ptr=(
++                retire_epoch_table if use_retire_epoch else retire_dummy
++            ),
++            retire_seq_scope_slots_ptr=(
++                retire_seq_scope_slots if use_retire_epoch else retire_dummy
++            ),
++            retire_seq_expected_versions_ptr=(
++                retire_seq_expected_versions if use_retire_epoch else retire_dummy
++            ),
++            retire_counters_ptr=(
++                retire_counters if use_retire_epoch else retire_dummy
++            ),
+             SLIDING_WINDOW=(1 + window_size[0]),
+             stride_k_cache_0=k.stride(0),
+             stride_k_cache_1=k.stride(1),
+@@ -973,6 +1055,7 @@ def unified_attention(
+             num_seqs=num_seqs,
+             BLOCK_M=BLOCK_M,
+             USE_FP8=output_scale is not None,
++            USE_RETIRE_EPOCH=use_retire_epoch,
+         )
+     else:
+         kernel_unified_attention_3d[
+diff --git a/vllm/v1/attention/backends/triton_attn.py b/vllm/v1/attention/backends/triton_attn.py
+index ca7be99..d4cf25b 100644
+--- a/vllm/v1/attention/backends/triton_attn.py
++++ b/vllm/v1/attention/backends/triton_attn.py
+@@ -78,6 +78,16 @@ class TritonAttentionMetadata:
+     prefix_scheduler_metadata: torch.Tensor | None = None
+     mm_prefix_range: dict[int, list[tuple[int, int]]] | None = None
+
++    # Optional RETIRE fast-path authority. These tensors are attached by the
++    # GPU runner after backend metadata construction so stock builders remain
++    # unchanged.
++    retire_epoch_table: torch.Tensor | None = None
++    retire_seq_scope_slots: torch.Tensor | None = None
++    retire_seq_expected_versions: torch.Tensor | None = None
++    retire_token_scope_slots: torch.Tensor | None = None
++    retire_token_expected_versions: torch.Tensor | None = None
++    retire_counters: torch.Tensor | None = None
++
+     @property
+     def mm_prefix_range_tensor(self) -> torch.Tensor | None:
+         """Convert mm_prefix_range dict to padded tensor for Triton kernel.
+@@ -441,6 +451,12 @@ class TritonAttentionImpl(AttentionImpl):
+                 self.kv_cache_dtype,
+                 layer._k_scale,
+                 layer._v_scale,
++                retire_epoch_table=attn_metadata.retire_epoch_table,
++                retire_token_scope_slots=attn_metadata.retire_token_scope_slots,
++                retire_token_expected_versions=(
++                    attn_metadata.retire_token_expected_versions
++                ),
++                retire_counters=attn_metadata.retire_counters,
+             )
+
+         if self.kv_cache_dtype.startswith("fp8"):
+@@ -492,6 +508,12 @@ class TritonAttentionImpl(AttentionImpl):
+             sinks=self.sinks,
+             output_scale=output_scale,
+             mm_prefix_range=mm_prefix_range_tensor,
++            retire_epoch_table=attn_metadata.retire_epoch_table,
++            retire_seq_scope_slots=attn_metadata.retire_seq_scope_slots,
++            retire_seq_expected_versions=(
++                attn_metadata.retire_seq_expected_versions
++            ),
++            retire_counters=attn_metadata.retire_counters,
+         )
+
+         return output
+diff --git a/vllm/v1/core/sched/output.py b/vllm/v1/core/sched/output.py
+index b69fa87..94e5927 100644
+--- a/vllm/v1/core/sched/output.py
++++ b/vllm/v1/core/sched/output.py
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+-from dataclasses import dataclass
++from dataclasses import dataclass, field
+ from functools import cached_property
+ from typing import TYPE_CHECKING
+
+@@ -207,6 +207,10 @@ class SchedulerOutput:
+     # EC Cache Connector metadata
+     ec_connector_metadata: ECConnectorMetadata | None = None
+
++    # RETIRE request_id -> (scope slot, packed generation:epoch version).
++    # Empty for stock requests and when the opt-in fast path is disabled.
++    retire_request_tags: dict[str, tuple[int, int]] = field(default_factory=dict)
++
+     @classmethod
+     def make_empty(cls) -> "SchedulerOutput":
+         return cls(
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 2aa04c9..d502f48 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1057,6 +1057,72 @@ class Scheduler(SchedulerInterface):
+         scheduler_output: SchedulerOutput,
+         model_runner_output: ModelRunnerOutput,
+     ) -> dict[int, EngineCoreOutputs]:
++        if model_runner_output.retire_rejected_request_ids:
++            # The worker observed ADVANCE during the model step. Preserve a
++            # reference to the last complete, hash-addressable prefix before
++            # finish_requests releases the request's ordinary page ownership.
++            # The in-flight chunk is deliberately absent from the hash index,
++            # so it cannot enter the retired hold or a successor block table.
++            manager = self.kv_cache_manager
++            holds = getattr(self, "_retire_rejected_holds", None)
++            if holds is None:
++                holds = self._retire_rejected_holds = {}
++            num_groups = len(manager.kv_cache_config.kv_cache_groups)
++            for request_id in model_runner_output.retire_rejected_request_ids:
++                request = self.requests.get(request_id)
++                if request is None or request.is_finished() or request_id in holds:
++                    continue
++                computed_groups, cached_tokens = (
++                    manager.coordinator.find_longest_cache_hit(
++                        request.block_hashes,
++                        request.num_tokens - 1,
++                    )
++                )
++                if len(computed_groups) != num_groups:
++                    raise RuntimeError(
++                        "RETIRE observed an inconsistent KV-group topology"
++                    )
++                physical_groups = [
++                    [block for block in group if not block.is_null]
++                    for group in computed_groups
++                ]
++                all_resident = (
++                    cached_tokens > 0
++                    and all(computed_groups)
++                    and all(physical_groups)
++                )
++                if all_resident:
++                    manager.block_pool.touch(tuple(physical_groups))
++                    group_block_ids = [
++                        [block.block_id for block in group]
++                        for group in computed_groups
++                    ]
++                    physical_group_block_ids = [
++                        [block.block_id for block in group]
++                        for group in physical_groups
++                    ]
++                    group_tokens = [cached_tokens for _ in range(num_groups)]
++                else:
++                    group_block_ids = [[] for _ in range(num_groups)]
++                    physical_group_block_ids = [[] for _ in range(num_groups)]
++                    group_tokens = [0 for _ in range(num_groups)]
++                holds[request_id] = {
++                    "block_hashes": request.block_hashes,
++                    "group_block_ids": group_block_ids,
++                    "physical_group_block_ids": physical_group_block_ids,
++                    "group_tokens": group_tokens,
++                    "pinned_tokens": min(group_tokens, default=0),
++                    "num_computed_tokens": request.num_computed_tokens,
++                    "all_blocks_resident": all_resident,
++                }
++
++            # Only authority is revoked here. The temporary retired hold above
++            # keeps the last committed prefix alive until FENCE transfers it
++            # to a protocol pin (or records that no reusable prefix existed).
++            self.finish_requests(
++                model_runner_output.retire_rejected_request_ids,
++                RequestStatus.FINISHED_ABORTED,
++            )
+         sampled_token_ids = model_runner_output.sampled_token_ids
+         logprobs = model_runner_output.logprobs
+         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
+diff --git a/vllm/v1/request.py b/vllm/v1/request.py
+index 3a885df..4a4ba79 100644
+--- a/vllm/v1/request.py
++++ b/vllm/v1/request.py
+@@ -118,6 +118,11 @@ class Request:
+         self.spec_token_ids: list[int] = []
+         self.num_computed_tokens = 0
+         self.cache_salt: str | None = cache_salt
++        from retire_serving.epoch_mailbox import decode_cache_salt_authority
++
++        self.cache_salt, self.retire_authority = decode_cache_salt_authority(
++            self.cache_salt
++        )
+
+         # Multi-modal related
+         self.mm_features = mm_features or []
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index 0045b8c..92a333c 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -299,7 +299,48 @@ class EngineCore:
+                 "Disabling KVTransfer for this request."
+             )
+
++        authority = getattr(request, "retire_authority", None)
++        if authority is not None:
++            tags = getattr(self, "_retire_request_tags", None)
++            if tags is None:
++                tags = self._retire_request_tags = {}
++            tags[request.request_id] = authority
+         self.scheduler.add_request(request)
++        # Registration and actual scheduler admission are separate IPC
++        # operations. Recheck after insertion so an ADVANCE+FENCE that ran
++        # between them cannot be followed by a late stale request. If the
++        # request was current when inserted, a later FENCE observes it in the
++        # scheduler; if it was already stale, finish it immediately here.
++        tag = getattr(self, "_retire_request_tags", {}).get(request.request_id)
++        if tag is not None:
++            scope_slot, expected_version = tag
++            from retire_serving.epoch_mailbox import (
++                host_check_version,
++                layer_safe_point_horizon,
++            )
++
++            device_safe = True
++            preadmitted = getattr(
++                self, "_retire_preadmitted_request_tags", {}
++            ).pop(request.request_id, None)
++            if layer_safe_point_horizon() > 0 and preadmitted != tag:
++                workers = self.collective_rpc(
++                    "retire_epoch_admission",
++                    args=(int(scope_slot), int(expected_version)),
++                )
++                device_safe = bool(workers) and all(
++                    item.get("admission_safe") for item in workers
++                )
++            receipt = host_check_version(
++                int(scope_slot), int(expected_version)
++            )
++            if not device_safe or not bool(receipt.get("admission_safe")):
++                self._retire_late_admission_rejections = getattr(
++                    self, "_retire_late_admission_rejections", 0
++                ) + 1
++                self.scheduler.finish_requests(
++                    [request.request_id], RequestStatus.FINISHED_ABORTED
++                )
+
+     def abort_requests(self, request_ids: list[str]):
+         """Abort requests from the scheduler."""
+@@ -307,6 +307,938 @@ class EngineCore:
+         # (i.e. client-aborted vs stop criteria met).
+         self.scheduler.finish_requests(request_ids, RequestStatus.FINISHED_ABORTED)
+
++    def retire_register_request_tag(
++        self, request_id: str, scope_slot: int, expected_version: int
++    ) -> dict[str, Any]:
++        """Register immutable execution authority before request admission."""
++        result = self.retire_register_request_tags(
++            [(request_id, int(scope_slot), int(expected_version))]
++        )
++        return result["requests"][0]
++
++    def retire_register_request_tags(
++        self, request_tags: list[tuple[str, int, int]]
++    ) -> dict[str, Any]:
++        """Register a concurrent authority group with one worker barrier."""
++        tags = getattr(self, "_retire_request_tags", None)
++        if tags is None:
++            tags = self._retire_request_tags = {}
++        preadmitted = getattr(self, "_retire_preadmitted_request_tags", None)
++        if preadmitted is None:
++            preadmitted = self._retire_preadmitted_request_tags = {}
++        from retire_serving.epoch_mailbox import (
++            host_check_version,
++            layer_safe_point_horizon,
++        )
++
++        normalized = [
++            (str(request_id), int(scope_slot), int(expected_version))
++            for request_id, scope_slot, expected_version in request_tags
++        ]
++        authorities = [
++            (scope_slot, expected_version)
++            for _, scope_slot, expected_version in normalized
++        ]
++        if layer_safe_point_horizon() <= 0:
++            worker_rows = [[host_check_version(slot, version)] for slot, version in authorities]
++        else:
++            workers = self.collective_rpc(
++                "retire_epoch_admission_batch",
++                args=(authorities,),
++            )
++            worker_rows = [
++                [worker[index] for worker in workers]
++                for index in range(len(normalized))
++            ]
++        results = []
++        for (request_id, scope_slot, expected_version), receipts in zip(
++            normalized, worker_rows, strict=True
++        ):
++            admission_safe = bool(receipts) and all(
++                item.get("admission_safe") for item in receipts
++            )
++            tag = (scope_slot, expected_version)
++            if admission_safe:
++                tags[request_id] = tag
++                preadmitted[request_id] = tag
++            results.append(
++                {
++                    "request_id": request_id,
++                    "scope_slot": scope_slot,
++                    "expected_version": expected_version,
++                    "admission_safe": admission_safe,
++                    "superseded_before_admission": bool(receipts)
++                    and not admission_safe
++                    and any(
++                        item.get("superseded_before_admission")
++                        for item in receipts
++                    ),
++                    "workers": receipts,
++                }
++            )
++        return {"requests": results}
++
++    def _retire_attach_request_tags(
++        self, scheduler_output: SchedulerOutput
++    ) -> None:
++        from retire_serving.epoch_mailbox import (
++            layer_safe_point_horizon,
++            layer_safe_point_min_tokens,
++        )
++
++        # A reuse expectation is registered before successor admission.  Save
++        # its first allocated block table at this scheduler boundary so an
++        # asynchronous frontend audit remains meaningful even if a short
++        # successor finishes before the audit RPC is serviced.
++        expectations = getattr(self, "_retire_reuse_expectations", {})
++        snapshots = getattr(self, "_retire_request_block_snapshots", None)
++        if snapshots is None:
++            snapshots = self._retire_request_block_snapshots = {}
++        manager = self.scheduler.kv_cache_manager
++        for request_id in tuple(expectations):
++            if request_id not in scheduler_output.num_scheduled_tokens:
++                continue
++            request = self.scheduler.requests.get(request_id)
++            if request is not None and not request.is_finished():
++                snapshots[request_id] = {
++                    "group_block_ids": manager.get_block_ids(request_id),
++                    "num_computed_tokens": request.num_computed_tokens,
++                }
++                expectations.pop(request_id, None)
++
++        if layer_safe_point_horizon() <= 0:
++            scheduler_output.retire_request_tags = {}
++            return
++        tags = getattr(self, "_retire_request_tags", {})
++        scheduled_tags = {
++            request_id: tags[request_id]
++            for request_id in scheduler_output.num_scheduled_tokens
++            if request_id in tags
++        }
++        if (
++            scheduler_output.total_num_scheduled_tokens
++            >= layer_safe_point_min_tokens()
++        ):
++            scheduler_output.retire_request_tags = scheduled_tags
++        else:
++            scheduler_output.retire_request_tags = {}
++            pending = getattr(self, "_retire_boundary_tags", None)
++            if pending is None:
++                pending = self._retire_boundary_tags = {}
++            # Keep short-step authority local to EngineCore.  Putting it in
++            # SchedulerOutput would serialize an otherwise unused tag map to
++            # every worker on every decode step.
++            pending[id(scheduler_output)] = scheduled_tags
++
++    def _retire_close_boundary_authority(
++        self,
++        scheduler_output: SchedulerOutput,
++        model_output: ModelRunnerOutput,
++    ) -> None:
++        """Reject a stale short step before scheduler/KV/output publication."""
++        tags = getattr(self, "_retire_boundary_tags", {}).pop(
++            id(scheduler_output), {}
++        )
++        if not tags:
++            return
++        from retire_serving.epoch_mailbox import get_frontend_mailbox
++
++        mailbox = get_frontend_mailbox()
++        rejected = {
++            request_id
++            for request_id, (scope_slot, expected_version) in tags.items()
++            if mailbox.read_slot(scope_slot) != expected_version
++        }
++        if rejected:
++            model_output.retire_rejected_request_ids.update(rejected)
++            self._retire_boundary_output_rejections = getattr(
++                self, "_retire_boundary_output_rejections", 0
++            ) + len(rejected)
++
++    def retire_epoch_audit(self) -> dict[str, Any]:
++        """Synchronize and collect kernel/publication counters from workers."""
++        return {
++            "workers": self.collective_rpc("retire_epoch_audit"),
++            "late_admission_rejections": getattr(
++                self, "_retire_late_admission_rejections", 0
++            ),
++            "boundary_output_rejections": getattr(
++                self, "_retire_boundary_output_rejections", 0
++            ),
++        }
++
++    def _retire_group_metadata(self) -> list[dict[str, Any]]:
++        groups = self.scheduler.kv_cache_manager.kv_cache_config.kv_cache_groups
++        return [
++            {
++                "group_id": f"group-{group_id}",
++                "group_index": group_id,
++                "block_size": group.kv_cache_spec.block_size,
++                "layout": type(group.kv_cache_spec).__name__,
++            }
++            for group_id, group in enumerate(groups)
++        ]
++
++    def retire_inspect_topology(self) -> dict[str, Any]:
++        """Return the exact topology used by retirement certificates."""
++        parallel = self.vllm_config.parallel_config
++        return {
++            "tensor_parallel_size": parallel.tensor_parallel_size,
++            "pipeline_parallel_size": parallel.pipeline_parallel_size,
++            "kv_cache_groups": self._retire_group_metadata(),
++            "speculative_mode": "draft-verify" if self.use_spec_decode else "disabled",
++        }
++
++    def retire_cache_snapshot(self) -> dict[str, Any]:
++        """Return allocation state for controlled KV-pressure experiments."""
++        pool = self.scheduler.kv_cache_manager.block_pool
++        blocks = [block for block in pool.blocks if not block.is_null]
++        pin_sets = getattr(self, "_retire_pin_sets", {})
++        pinned_ids = {
++            int(block_id)
++            for groups in pin_sets.values()
++            for group in groups
++            for block_id in group
++        }
++        return {
++            "total_blocks": len(blocks),
++            "free_blocks": pool.get_num_free_blocks(),
++            "referenced_blocks": sum(block.ref_cnt > 0 for block in blocks),
++            "hashed_blocks": sum(block.block_hash is not None for block in blocks),
++            "evictable_cached_blocks": sum(
++                block.ref_cnt == 0 and block.block_hash is not None
++                for block in blocks
++            ),
++            "pinned_blocks": len(pinned_ids),
++        }
++
++    def _retire_distributed_fence(self, sequence: int) -> list[dict[str, Any]]:
++        """Synchronize every model worker and collect a rank-level receipt."""
++        receipts = self.collective_rpc("retire_fence_ack", args=(sequence,))
++        expected = (
++            self.vllm_config.parallel_config.tensor_parallel_size
++            * self.vllm_config.parallel_config.pipeline_parallel_size
++        )
++        if len(receipts) != expected:
++            raise RuntimeError(
++                f"RETIRE expected {expected} worker receipts, got {len(receipts)}"
++            )
++        return receipts
++
++    def retire_fence_and_pin(
++        self,
++        pin_key: str,
++        request_ids: list[str],
++        tenant_id: str = "default",
++        tenant_pin_quota_blocks: int | None = None,
++    ) -> dict[str, Any]:
++        """Fence requests at a distributed safe point and pin complete KV.
++
++        Utility RPCs execute on the EngineCore thread between model steps.
++        The worker collective adds an explicit CUDA-stream acknowledgement
++        from every TP/PP participant. Pins are acquired before abort releases
++        request references, so cached physical blocks cannot be recycled
++        before the successor adopts them.
++        """
++        pin_sets = getattr(self, "_retire_pin_sets", None)
++        if pin_sets is None:
++            pin_sets = self._retire_pin_sets = {}
++        if pin_key in pin_sets:
++            raise ValueError(f"RETIRE pin key already exists: {pin_key}")
++
++        sequence = getattr(self, "_retire_safe_point_sequence", 0) + 1
++        self._retire_safe_point_sequence = sequence
++        worker_receipts = self._retire_distributed_fence(sequence)
++        group_metadata = self._retire_group_metadata()
++        scheduler = self.scheduler
++        manager = scheduler.kv_cache_manager
++        retired_holds = getattr(scheduler, "_retire_rejected_holds", {})
++
++        participants = []
++        for worker in worker_receipts:
++            if not worker.get("writer_drained"):
++                raise RuntimeError(f"RETIRE worker did not drain: {worker}")
++            for group in group_metadata:
++                participants.append(
++                    {
++                        "tensor_parallel_rank": worker["tensor_parallel_rank"],
++                        "pipeline_parallel_rank": worker["pipeline_parallel_rank"],
++                        "kv_group_id": group["group_id"],
++                        "acknowledged": True,
++                        "writer_drained": True,
++                        "speculation_drained": True,
++                        "codec_drained": True,
++                        "transfer_drained": True,
++                        "safe_point_sequence": sequence,
++                        "detail": "worker CUDA stream synchronized after model step",
++                    }
++                )
++
++        sources: dict[str, Any] = {}
++        pinned_group_block_ids = [[] for _ in group_metadata]
++        source_block_hashes: dict[str, Any] = {}
++        for request_id in request_ids:
++            request = scheduler.requests.get(request_id)
++            if request is None or request.is_finished():
++                hold = retired_holds.pop(request_id, None)
++                if hold is not None:
++                    group_ids = hold["group_block_ids"]
++                    physical_group_ids = hold["physical_group_block_ids"]
++                    group_tokens = hold["group_tokens"]
++                    all_resident = bool(hold["all_blocks_resident"])
++                    if len(group_ids) != len(group_metadata):
++                        raise RuntimeError(
++                            "RETIRE retired hold has inconsistent KV groups"
++                        )
++                    if all_resident:
++                        source_block_hashes[request_id] = hold["block_hashes"]
++                        for group_id, selected in enumerate(physical_group_ids):
++                            pinned_group_block_ids[group_id].extend(selected)
++                    pinned_tokens = int(hold["pinned_tokens"])
++                    sources[request_id] = {
++                        "present": True,
++                        "retired_hold": True,
++                        "writer_drained": True,
++                        "all_blocks_resident": all_resident,
++                        "pinned_tokens": pinned_tokens,
++                        "committed_tokens": pinned_tokens,
++                        "group_block_ids": group_ids,
++                        "group_tokens": group_tokens,
++                        "num_computed_tokens": hold["num_computed_tokens"],
++                    }
++                    continue
++                sources[request_id] = {
++                    "present": False,
++                    "writer_drained": True,
++                    "all_blocks_resident": False,
++                    "pinned_tokens": 0,
++                    "committed_tokens": 0,
++                    "group_block_ids": [[] for _ in group_metadata],
++                    "group_tokens": [0 for _ in group_metadata],
++                }
++                continue
++
++            computed_groups, cached_tokens = (
++                manager.coordinator.find_longest_cache_hit(
++                    request.block_hashes,
++                    request.num_tokens - 1,
++                )
++            )
++            if len(computed_groups) != len(group_metadata):
++                raise RuntimeError("RETIRE observed an inconsistent KV-group topology")
++            source_group_blocks = [list(group) for group in computed_groups]
++            source_physical_blocks = [
++                [block for block in group if not block.is_null]
++                for group in source_group_blocks
++            ]
++            source_group_ids = [
++                [block.block_id for block in group]
++                for group in source_group_blocks
++            ]
++            all_resident = (
++                cached_tokens > 0
++                and all(source_group_blocks)
++                and all(source_physical_blocks)
++            )
++            group_tokens = [cached_tokens for _ in group_metadata]
++
++            if all_resident:
++                manager.block_pool.touch(tuple(source_physical_blocks))
++                source_block_hashes[request_id] = request.block_hashes
++                for group_id, selected in enumerate(source_physical_blocks):
++                    pinned_group_block_ids[group_id].extend(
++                        block.block_id for block in selected
++                    )
++            else:
++                source_group_ids = [[] for _ in group_metadata]
++                group_tokens = [0 for _ in group_metadata]
++
++            pinned_tokens = min(group_tokens, default=0)
++            sources[request_id] = {
++                "present": True,
++                "writer_drained": True,
++                "all_blocks_resident": all_resident,
++                "pinned_tokens": pinned_tokens,
++                "committed_tokens": pinned_tokens,
++                "group_block_ids": source_group_ids,
++                "group_tokens": group_tokens,
++                "num_computed_tokens": request.num_computed_tokens,
++            }
++
++        tenant_usage = getattr(self, "_retire_tenant_pinned_blocks", None)
++        if tenant_usage is None:
++            tenant_usage = self._retire_tenant_pinned_blocks = {}
++        pin_tenants = getattr(self, "_retire_pin_tenants", None)
++        if pin_tenants is None:
++            pin_tenants = self._retire_pin_tenants = {}
++        pinned_blocks = sum(map(len, pinned_group_block_ids))
++        current_tenant_blocks = int(tenant_usage.get(tenant_id, 0))
++        quota_exceeded = (
++            tenant_pin_quota_blocks is not None
++            and current_tenant_blocks + pinned_blocks > tenant_pin_quota_blocks
++        )
++        if quota_exceeded:
++            block_ids = [item for group in pinned_group_block_ids for item in group]
++            if block_ids:
++                manager.block_pool.free_blocks(
++                    [manager.block_pool.blocks[item] for item in reversed(block_ids)]
++                )
++            pinned_group_block_ids = [[] for _ in group_metadata]
++            pinned_blocks = 0
++            for source in sources.values():
++                source["all_blocks_resident"] = False
++                source["pinned_tokens"] = 0
++                source["committed_tokens"] = 0
++                source["group_block_ids"] = [[] for _ in group_metadata]
++                source["group_tokens"] = [0 for _ in group_metadata]
++                source["tenant_quota_exceeded"] = True
++        else:
++            tenant_usage[tenant_id] = current_tenant_blocks + pinned_blocks
++        pin_tenants[pin_key] = tenant_id
++
++        self.abort_requests(request_ids)
++        pin_sets[pin_key] = pinned_group_block_ids
++        pin_hashes = getattr(self, "_retire_pin_hashes", None)
++        if pin_hashes is None:
++            pin_hashes = self._retire_pin_hashes = {}
++        pin_hashes[pin_key] = source_block_hashes
++        return {
++            "pin_key": pin_key,
++            "safe_point": True,
++            "safe_point_sequence": sequence,
++            "pinned_blocks": pinned_blocks,
++            "tenant_id": tenant_id,
++            "tenant_pin_quota_blocks": tenant_pin_quota_blocks,
++            "tenant_pinned_blocks": int(tenant_usage.get(tenant_id, 0)),
++            "tenant_quota_exceeded": quota_exceeded,
++            "tensor_parallel_size": (
++                self.vllm_config.parallel_config.tensor_parallel_size
++            ),
++            "pipeline_parallel_size": (
++                self.vllm_config.parallel_config.pipeline_parallel_size
++            ),
++            "kv_cache_groups": group_metadata,
++            "participants": participants,
++            "sources": sources,
++        }
++
++    def retire_trim_pins(
++        self, pin_key: str, source_request_id: str, reuse_tokens: int
++    ) -> dict[str, Any]:
++        """Force a shorter exact reuse boundary and release its guard band."""
++        pin_sets = getattr(self, "_retire_pin_sets", {})
++        current = pin_sets.get(pin_key)
++        if current is None:
++            raise KeyError(f"unknown RETIRE pin key: {pin_key}")
++        hashes = getattr(self, "_retire_pin_hashes", {}).get(pin_key, {}).get(
++            source_request_id
++        )
++        if hashes is None:
++            raise KeyError(f"RETIRE source was not pinned: {source_request_id}")
++        manager = self.scheduler.kv_cache_manager
++        computed_groups, cached_tokens = manager.coordinator.find_longest_cache_hit(
++            hashes, reuse_tokens
++        )
++        if cached_tokens != reuse_tokens:
++            raise RuntimeError(
++                f"RETIRE exact prefix fell out of cache: {cached_tokens} != "
++                f"{reuse_tokens}"
++            )
++        keep_logical_group_block_ids = [
++            [block.block_id for block in group] for group in computed_groups
++        ]
++        keep_physical_group_block_ids = [
++            [block.block_id for block in group if not block.is_null]
++            for group in computed_groups
++        ]
++        if len(current) != len(keep_physical_group_block_ids):
++            raise ValueError("RETIRE trim does not cover every KV-cache group")
++        original_count = sum(map(len, current))
++        target_count = sum(map(len, keep_physical_group_block_ids))
++        if target_count > original_count:
++            raise RuntimeError("RETIRE shorter prefix requires more pinned blocks")
++        retained: list[list[int]] = []
++        released: list[int] = []
++        missing_groups = []
++        for current_group, keep_group in zip(
++            current, keep_physical_group_block_ids, strict=True
++        ):
++            remaining = set(keep_group)
++            for item in current_group:
++                if item in remaining:
++                    remaining.remove(item)
++                else:
++                    released.append(item)
++            missing_groups.append(
++                [manager.block_pool.blocks[item] for item in remaining]
++            )
++            retained.append(list(keep_group))
++        pool = manager.block_pool
++        if any(missing_groups):
++            # An equivalent hash may resolve to a different free cache block
++            # at the shorter hybrid prefix. The EngineCore is still inside
++            # the distributed safe point, so acquire those references before
++            # releasing the superseded physical choices.
++            pool.touch(tuple(missing_groups))
++        if released:
++            retained_ids = {item for group in retained for item in group}
++            pool.evict_blocks(set(released) - retained_ids)
++            pool.free_blocks(
++                [pool.blocks[block_id] for block_id in reversed(released)]
++            )
++            tenant = getattr(self, "_retire_pin_tenants", {}).get(pin_key)
++            usage = getattr(self, "_retire_tenant_pinned_blocks", {})
++            if tenant is not None:
++                usage[tenant] = max(
++                    0,
++                    int(usage.get(tenant, 0))
++                    - (original_count - target_count),
++                )
++        pin_sets[pin_key] = retained
++        return {
++            "kept_blocks": sum(map(len, retained)),
++            "released_blocks": len(released),
++            "kept_group_block_ids": keep_logical_group_block_ids,
++        }
++
++    def retire_expect_request_blocks(
++        self, request_id: str, expected_group_block_ids: list[list[int]]
++    ) -> dict[str, Any]:
++        """Arm a one-shot scheduler-boundary adoption snapshot."""
++        expectations = getattr(self, "_retire_reuse_expectations", None)
++        if expectations is None:
++            expectations = self._retire_reuse_expectations = {}
++        expectations[request_id] = [
++            list(map(int, group)) for group in expected_group_block_ids
++        ]
++        return {"request_id": request_id, "armed": True}
++
++    def retire_cancel_request_expectation(self, request_id: str) -> dict[str, Any]:
++        """Drop verification state for a successor retired before first output."""
++        expected = getattr(self, "_retire_reuse_expectations", {}).pop(
++            request_id, None
++        )
++        snapshot = getattr(self, "_retire_request_block_snapshots", {}).pop(
++            request_id, None
++        )
++        return {
++            "request_id": request_id,
++            "removed": expected is not None or snapshot is not None,
++        }
++
++    def retire_verify_request_blocks(
++        self, request_id: str, expected_group_block_ids: list[list[int]]
++    ) -> dict[str, Any]:
++        """Verify the successor installed every pinned physical group prefix."""
++        request = self.scheduler.requests.get(request_id)
++        snapshot = getattr(self, "_retire_request_block_snapshots", {}).pop(
++            request_id, None
++        )
++        request_present = request is not None and not request.is_finished()
++        if not request_present and snapshot is None:
++            return {
++                "request_present": False,
++                "scheduler_snapshot_present": False,
++                "installed_group_block_ids": [],
++                "same_physical_blocks": False,
++            }
++        manager = self.scheduler.kv_cache_manager
++        if request_present:
++            group_ids = manager.get_block_ids(request_id)
++            num_computed_tokens = request.num_computed_tokens
++        else:
++            group_ids = snapshot["group_block_ids"]
++            num_computed_tokens = int(snapshot["num_computed_tokens"])
++        if len(group_ids) != len(expected_group_block_ids):
++            raise ValueError("RETIRE verify does not cover every KV-cache group")
++        groups = manager.kv_cache_config.kv_cache_groups
++        null_block_id = manager.block_pool.null_block.block_id
++        installed = []
++        group_verifications = []
++        for group_index, (actual, expected, group) in enumerate(
++            zip(group_ids, expected_group_block_ids, groups, strict=True)
++        ):
++            actual_prefix = list(actual[: len(expected)])
++            spec = group.kv_cache_spec
++            live_start = 0
++            layout = type(spec).__name__
++            if layout == "SlidingWindowSpec":
++                skipped_tokens = max(
++                    0,
++                    num_computed_tokens - int(spec.sliding_window) + 1,
++                )
++                live_start = min(
++                    len(expected), skipped_tokens // int(spec.block_size)
++                )
++            elif layout == "ChunkedLocalAttentionSpec":
++                skipped_tokens = (
++                    num_computed_tokens
++                    // int(spec.attention_chunk_size)
++                    * int(spec.attention_chunk_size)
++                )
++                live_start = min(
++                    len(expected), skipped_tokens // int(spec.block_size)
++                )
++            retired_expected = list(expected[:live_start])
++            retired_installed = actual_prefix[:live_start]
++            live_expected = list(expected[live_start:])
++            live_installed = actual_prefix[live_start:]
++            retired_slots_cleared = all(
++                block_id == null_block_id for block_id in retired_installed
++            )
++            same_physical = (
++                len(actual_prefix) == len(expected)
++                and retired_slots_cleared
++                and live_installed == live_expected
++            )
++            installed.append(actual_prefix)
++            group_verifications.append(
++                {
++                    "group_index": group_index,
++                    "layout": layout,
++                    "live_start_block": live_start,
++                    "expected_block_ids": list(expected),
++                    "installed_block_ids": actual_prefix,
++                    "retired_expected_block_ids": retired_expected,
++                    "retired_installed_block_ids": retired_installed,
++                    "live_expected_block_ids": live_expected,
++                    "live_installed_block_ids": live_installed,
++                    "verified_live_physical_block_ids": [
++                        block_id
++                        for block_id in live_expected
++                        if block_id != null_block_id
++                    ],
++                    "retired_slots_cleared": retired_slots_cleared,
++                    "same_physical_blocks": same_physical,
++                }
++            )
++        return {
++            "request_present": request_present,
++            "scheduler_snapshot_present": snapshot is not None,
++            "installed_group_block_ids": installed,
++            "group_verifications": group_verifications,
++            "same_physical_blocks": all(
++                item["same_physical_blocks"] for item in group_verifications
++            ),
++        }
++
++    def retire_snapshot_request_blocks(self, request_id: str) -> dict[str, Any]:
++        """Read one request's logical block ownership between model steps."""
++        request = self.scheduler.requests.get(request_id)
++        if request is None or request.is_finished():
++            return {
++                "request_present": False,
++                "group_block_ids": [],
++                "num_computed_tokens": 0,
++            }
++        group_ids = self.scheduler.kv_cache_manager.get_block_ids(request_id)
++        return {
++            "request_present": True,
++            "group_block_ids": [list(group) for group in group_ids],
++            "num_computed_tokens": request.num_computed_tokens,
++        }
++
++    def retire_digest_blocks(
++        self, group_block_ids: list[list[int]]
++    ) -> dict[str, Any]:
++        """Digest an immutable physical KV prefix on every worker."""
++        import hashlib
++
++        workers = self.collective_rpc(
++            "retire_digest_blocks", args=(group_block_ids,)
++        )
++        aggregate = hashlib.sha256()
++        for item in sorted(
++            workers,
++            key=lambda row: (
++                int(row.get("pipeline_parallel_rank", 0)),
++                int(row.get("tensor_parallel_rank", 0)),
++            ),
++        ):
++            aggregate.update(str(item["kv_sha256"]).encode())
++        return {
++            "workers": workers,
++            "kv_sha256": aggregate.hexdigest(),
++            "digested_bytes": sum(
++                int(item["digested_bytes"]) for item in workers
++            ),
++        }
++
++    def retire_offload_pins(
++        self, pin_key: str, codec: str, destructive: bool = True
++    ) -> dict[str, Any]:
++        """Move pinned KV bytes through a lossless worker-local DRAM codec."""
++        group_block_ids = getattr(self, "_retire_pin_sets", {}).get(pin_key)
++        if group_block_ids is None:
++            raise KeyError(f"unknown RETIRE pin key: {pin_key}")
++        workers = self.collective_rpc(
++            "retire_offload_blocks",
++            args=(pin_key, group_block_ids, codec, destructive),
++        )
++        drained = bool(workers) and all(
++            item.get("operation_drained") for item in workers
++        )
++        return {
++            "codec": codec,
++            "operation_drained": drained,
++            "workers": workers,
++            "raw_bytes": sum(item["raw_bytes"] for item in workers),
++            "encoded_bytes": sum(item["encoded_bytes"] for item in workers),
++        }
++
++    def retire_offload_pins_capacity(
++        self, pin_key: str, codec: str
++    ) -> dict[str, Any]:
++        """Offload one pinned prefix and return its HBM blocks to the pool.
++
++        The worker copy completes before allocator metadata is changed.  The
++        old hash entries are then removed and the transient pin references are
++        released, so later requests may overwrite the physical slots.  Restore
++        therefore allocates fresh slots and publishes their hashes only after
++        the D2H/H2D round trip has passed its integrity check.
++        """
++        pin_sets = getattr(self, "_retire_pin_sets", {})
++        group_block_ids = pin_sets.get(pin_key)
++        if group_block_ids is None:
++            raise KeyError(f"unknown RETIRE pin key: {pin_key}")
++        source_hashes = getattr(self, "_retire_pin_hashes", {}).get(
++            pin_key, {}
++        )
++        if len(source_hashes) != 1:
++            raise RuntimeError(
++                "capacity-reclaiming offload requires one unambiguous source"
++            )
++        manager = self.scheduler.kv_cache_manager
++        groups = manager.kv_cache_config.kv_cache_groups
++        if len(group_block_ids) != len(groups):
++            raise RuntimeError("RETIRE offload does not cover every KV group")
++        if any(
++            type(group.kv_cache_spec).__name__ != "FullAttentionSpec"
++            for group in groups
++        ):
++            raise RuntimeError(
++                "capacity-reclaiming offload currently requires full-attention "
++                "KV groups"
++            )
++
++        offload = self.retire_offload_pins(pin_key, codec, True)
++        if not offload["operation_drained"]:
++            raise RuntimeError("RETIRE capacity offload did not drain")
++
++        block_ids = [item for group in group_block_ids for item in group]
++        pool = manager.block_pool
++        free_before = pool.get_num_free_blocks()
++        if any(pool.blocks[item].ref_cnt != 1 for item in block_ids):
++            raise RuntimeError(
++                "capacity offload found a block with an external live owner"
++            )
++        if block_ids:
++            pool.evict_blocks(set(block_ids))
++            pool.free_blocks(
++                [pool.blocks[item] for item in reversed(block_ids)]
++            )
++        free_after = pool.get_num_free_blocks()
++        if free_after - free_before != len(block_ids):
++            raise RuntimeError("capacity offload failed to return every HBM block")
++
++        layouts = getattr(self, "_retire_offload_layouts", None)
++        if layouts is None:
++            layouts = self._retire_offload_layouts = {}
++        layouts[pin_key] = [len(group) for group in group_block_ids]
++        offloaded_groups = getattr(self, "_retire_offload_group_ids", None)
++        if offloaded_groups is None:
++            offloaded_groups = self._retire_offload_group_ids = {}
++        offloaded_groups[pin_key] = [
++            list(group) for group in group_block_ids
++        ]
++        pin_sets[pin_key] = [[] for _ in group_block_ids]
++        tenant = getattr(self, "_retire_pin_tenants", {}).get(pin_key)
++        usage = getattr(self, "_retire_tenant_pinned_blocks", {})
++        if tenant is not None:
++            usage[tenant] = max(
++                0, int(usage.get(tenant, 0)) - len(block_ids)
++            )
++        offload.update(
++            {
++                "capacity_reclaimed": True,
++                "released_hbm_blocks": len(block_ids),
++                "free_blocks_before": free_before,
++                "free_blocks_after": free_after,
++                "offloaded_group_block_ids": offloaded_groups[pin_key],
++            }
++        )
++        return offload
++
++    def retire_restore_pins(self, pin_key: str) -> dict[str, Any]:
++        """Restore the active pinned prefix from worker-local DRAM."""
++        group_block_ids = getattr(self, "_retire_pin_sets", {}).get(pin_key)
++        if group_block_ids is None:
++            raise KeyError(f"unknown RETIRE pin key: {pin_key}")
++        workers = self.collective_rpc(
++            "retire_restore_blocks", args=(pin_key, group_block_ids)
++        )
++        verified = bool(workers) and all(
++            item.get("operation_drained") and item.get("integrity_verified")
++            for item in workers
++        )
++        return {
++            "operation_drained": verified,
++            "integrity_verified": verified,
++            "workers": workers,
++            "restored_bytes": sum(item["restored_bytes"] for item in workers),
++        }
++
++    def retire_restore_capacity_pins(
++        self,
++        pin_key: str,
++        source_request_id: str,
++        reuse_tokens: int,
++    ) -> dict[str, Any]:
++        """Restore an offloaded prefix into fresh slots, then publish it."""
++        from vllm.v1.core.kv_cache_utils import (
++            BlockHashListWithBlockSize,
++            make_block_hash_with_group_id,
++        )
++
++        pin_sets = getattr(self, "_retire_pin_sets", {})
++        current = pin_sets.get(pin_key)
++        layouts = getattr(self, "_retire_offload_layouts", {})
++        stored_layout = layouts.get(pin_key)
++        original_groups = getattr(self, "_retire_offload_group_ids", {}).get(
++            pin_key
++        )
++        if current is None or stored_layout is None or original_groups is None:
++            raise KeyError(f"unknown capacity-offloaded RETIRE pin: {pin_key}")
++        if any(current):
++            raise RuntimeError("capacity-offloaded prefix still owns HBM blocks")
++        hashes = getattr(self, "_retire_pin_hashes", {}).get(pin_key, {}).get(
++            source_request_id
++        )
++        if hashes is None:
++            raise KeyError(f"RETIRE source was not offloaded: {source_request_id}")
++
++        manager = self.scheduler.kv_cache_manager
++        pool = manager.block_pool
++        groups = manager.kv_cache_config.kv_cache_groups
++        target_counts = [
++            min(
++                stored,
++                reuse_tokens // int(group.kv_cache_spec.block_size),
++            )
++            for stored, group in zip(stored_layout, groups, strict=True)
++        ]
++        total = sum(target_counts)
++        if total <= 0:
++            raise RuntimeError("RETIRE capacity restore has an empty prefix")
++        free_before = pool.get_num_free_blocks()
++        blocks = pool.get_new_blocks(total)
++        target_groups = []
++        cursor = 0
++        for count in target_counts:
++            target_groups.append(blocks[cursor : cursor + count])
++            cursor += count
++        target_ids = [
++            [block.block_id for block in group] for group in target_groups
++        ]
++        published_ids: set[int] = set()
++
++        try:
++            workers = self.collective_rpc(
++                "retire_restore_blocks", args=(pin_key, target_ids)
++            )
++            verified = bool(workers) and all(
++                item.get("operation_drained")
++                and item.get("integrity_verified")
++                for item in workers
++            )
++            if not verified:
++                raise RuntimeError("capacity restore failed integrity verification")
++
++            for group_id, (group, target_blocks) in enumerate(
++                zip(groups, target_groups, strict=True)
++            ):
++                block_size = int(group.kv_cache_spec.block_size)
++                if block_size == pool.hash_block_size:
++                    group_hashes = hashes
++                else:
++                    if block_size % pool.hash_block_size != 0:
++                        raise RuntimeError(
++                            "RETIRE cannot align restored block hashes"
++                        )
++                    group_hashes = BlockHashListWithBlockSize(
++                        hashes, pool.hash_block_size, block_size
++                    )
++                for block, block_hash in zip(
++                    target_blocks, group_hashes, strict=False
++                ):
++                    block_hash_with_group = make_block_hash_with_group_id(
++                        block_hash, group_id
++                    )
++                    block.block_hash = block_hash_with_group
++                    pool.cached_block_hash_to_block.insert(
++                        block_hash_with_group, block
++                    )
++                    published_ids.add(block.block_id)
++        except BaseException:
++            if published_ids:
++                pool.evict_blocks(published_ids)
++            pool.free_blocks(reversed(blocks))
++            raise
++
++        pin_sets[pin_key] = target_ids
++        tenant = getattr(self, "_retire_pin_tenants", {}).get(pin_key)
++        usage = getattr(self, "_retire_tenant_pinned_blocks", {})
++        if tenant is not None:
++            usage[tenant] = int(usage.get(tenant, 0)) + total
++        layouts.pop(pin_key, None)
++        getattr(self, "_retire_offload_group_ids", {}).pop(pin_key, None)
++        remapped = sum(
++            old != new
++            for old_group, new_group in zip(
++                original_groups, target_ids, strict=True
++            )
++            for old, new in zip(old_group, new_group, strict=False)
++        )
++        return {
++            "operation_drained": True,
++            "integrity_verified": True,
++            "workers": workers,
++            "restored_bytes": sum(item["restored_bytes"] for item in workers),
++            "allocated_hbm_blocks": total,
++            "free_blocks_before": free_before,
++            "free_blocks_after": pool.get_num_free_blocks(),
++            "restored_group_block_ids": target_ids,
++            "remapped_hbm_blocks": remapped,
++            "conditional_publish": True,
++        }
++
++    def retire_release_pins(self, pin_key: str) -> dict[str, Any]:
++        """Release transient RETIRE references after successor adoption."""
++        pin_sets = getattr(self, "_retire_pin_sets", {})
++        group_block_ids = pin_sets.pop(pin_key, [])
++        getattr(self, "_retire_pin_hashes", {}).pop(pin_key, None)
++        getattr(self, "_retire_offload_layouts", {}).pop(pin_key, None)
++        getattr(self, "_retire_offload_group_ids", {}).pop(pin_key, None)
++        block_ids = [item for group in group_block_ids for item in group]
++        tenant = getattr(self, "_retire_pin_tenants", {}).pop(pin_key, None)
++        usage = getattr(self, "_retire_tenant_pinned_blocks", {})
++        if tenant is not None:
++            usage[tenant] = max(0, int(usage.get(tenant, 0)) - len(block_ids))
++        pool = self.scheduler.kv_cache_manager.block_pool
++        blocks = [pool.blocks[block_id] for block_id in reversed(block_ids)]
++        if blocks:
++            pool.free_blocks(blocks)
++        dram_dropped = self.collective_rpc("retire_drop_dram", args=(pin_key,))
++        sequence = getattr(self, "_retire_safe_point_sequence", 0) + 1
++        self._retire_safe_point_sequence = sequence
++        worker_receipts = self._retire_distributed_fence(sequence)
++        return {
++            "released_blocks": len(block_ids),
++            "safe_point_sequence": sequence,
++            "worker_receipts": worker_receipts,
++            "dram_dropped": dram_dropped,
++        }
++
+     @contextmanager
+     def log_error_detail(self, scheduler_output: SchedulerOutput):
+         """Execute the model and log detailed info on failure."""
+@@ -345,6 +902,7 @@ class EngineCore:
+         if not self.scheduler.has_requests():
+             return {}, False
+         scheduler_output = self.scheduler.schedule()
++        self._retire_attach_request_tags(scheduler_output)
+         future = self.model_executor.execute_model(scheduler_output, non_block=True)
+         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+         with self.log_error_detail(scheduler_output):
+@@ -351,6 +909,7 @@ class EngineCore:
+             model_output = future.result()
+             if model_output is None:
+                 model_output = self.model_executor.sample_tokens(grammar_output)
++        self._retire_close_boundary_authority(scheduler_output, model_output)
+
+         # Before processing the model output, process any aborts that happened
+         # during the model execution.
+@@ -399,6 +957,7 @@ class EngineCore:
+         deferred_scheduler_output = None
+         if self.scheduler.has_requests():
+             scheduler_output = self.scheduler.schedule()
++            self._retire_attach_request_tags(scheduler_output)
+             exec_future = self.model_executor.execute_model(
+                 scheduler_output, non_block=True
+             )
+@@ -447,9 +1006,10 @@ class EngineCore:
+         future, scheduler_output = batch_queue.pop()
+         with self.log_error_detail(scheduler_output):
+             model_output = future.result()
++        self._retire_close_boundary_authority(scheduler_output, model_output)
+
+         # Before processing the model output, process any aborts that happened
+         # during the model execution.
+         self._process_aborts_queue()
+         engine_core_outputs = self.scheduler.update_from_output(
+             scheduler_output, model_output
+diff --git a/vllm/v1/outputs.py b/vllm/v1/outputs.py
+index bea9e58..1c8b46e 100644
+--- a/vllm/v1/outputs.py
++++ b/vllm/v1/outputs.py
+@@ -177,6 +177,11 @@ class ModelRunnerOutput:
+     # information related to cudagraph execution
+     cudagraph_stats: CUDAGraphStat | None = None
+
++    # Requests whose packed scope version changed during this model step.
++    # The scheduler consumes this before accounting scheduled tokens, making
++    # its KV page-table update a version-checked publication point.
++    retire_rejected_request_ids: set[str] = field(default_factory=set)
++
+
+ # ModelRunnerOutput wrapper for async scheduling.
+ class AsyncModelRunnerOutput(ABC):
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index ca52532..d8b2af4 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -1517,6 +1517,64 @@ class GPUModelRunner(
+             spec_decode_metadata,
+         )
+
++    def _retire_attach_attention_metadata(
++        self,
++        attn_metadata: PerLayerAttnMetadata,
++        scheduler_output: "SchedulerOutput",
++        req_ids: list[str],
++        num_scheduled_tokens: np.ndarray,
++        num_tokens_padded: int,
++        num_reqs_padded: int,
++    ) -> None:
++        """Attach per-request authority to Triton metadata when configured."""
++        if not scheduler_output.retire_request_tags:
++            return
++        from retire_serving.epoch_mailbox import get_worker_epoch_state
++
++        state = get_worker_epoch_state()
++        if state is None:
++            raise RuntimeError("RETIRE tags arrived without a worker epoch relay")
++        if isinstance(attn_metadata, list):
++            raise RuntimeError("RETIRE epoch fast path does not yet support DBO")
++
++        seq_slots = np.full(num_reqs_padded, -1, dtype=np.int32)
++        seq_versions = np.zeros(num_reqs_padded, dtype=np.int64)
++        for index, req_id in enumerate(req_ids):
++            tag = scheduler_output.retire_request_tags.get(req_id)
++            if tag is not None:
++                seq_slots[index], seq_versions[index] = tag
++
++        token_slots = np.repeat(seq_slots[: len(req_ids)], num_scheduled_tokens)
++        token_versions = np.repeat(
++            seq_versions[: len(req_ids)], num_scheduled_tokens
++        )
++        if token_slots.size < num_tokens_padded:
++            token_slots = np.pad(
++                token_slots,
++                (0, num_tokens_padded - token_slots.size),
++                constant_values=-1,
++            )
++            token_versions = np.pad(
++                token_versions,
++                (0, num_tokens_padded - token_versions.size),
++                constant_values=0,
++            )
++
++        seq_slots_gpu = torch.from_numpy(seq_slots).to(self.device)
++        seq_versions_gpu = torch.from_numpy(seq_versions).to(self.device)
++        token_slots_gpu = torch.from_numpy(token_slots).to(self.device)
++        token_versions_gpu = torch.from_numpy(token_versions).to(self.device)
++
++        for metadata in attn_metadata.values():
++            if not hasattr(metadata, "retire_epoch_table"):
++                continue
++            metadata.retire_epoch_table = state.table
++            metadata.retire_seq_scope_slots = seq_slots_gpu
++            metadata.retire_seq_expected_versions = seq_versions_gpu
++            metadata.retire_token_scope_slots = token_slots_gpu
++            metadata.retire_token_expected_versions = token_versions_gpu
++            metadata.retire_counters = state.counters
++
+     def _build_attention_metadata(
+         self,
+         num_tokens: int,
+@@ -3049,6 +3107,14 @@ class GPUModelRunner(
+                         cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+                     )
+                 )
++                self._retire_attach_attention_metadata(
++                    attn_metadata,
++                    scheduler_output,
++                    req_ids,
++                    num_scheduled_tokens_np,
++                    num_tokens_padded,
++                    num_reqs_padded,
++                )
+
+             (
+                 input_ids,
+@@ -3298,6 +3364,27 @@ class GPUModelRunner(
+
+         with record_function_or_nullcontext("gpu_model_runner: eplb"):
+             self.eplb_step()
++        retire_rejected_request_ids: set[str] = set()
++        if scheduler_output.retire_request_tags:
++            from retire_serving.epoch_mailbox import get_worker_epoch_state
++
++            retire_state = get_worker_epoch_state()
++            if retire_state is None:
++                raise RuntimeError("RETIRE output tags arrived without epoch relay")
++            rejected = 0
++            for req_id, tag in scheduler_output.retire_request_tags.items():
++                req_index = req_id_to_index_output_copy.get(req_id)
++                if req_index is None:
++                    continue
++                scope_slot, expected_version = tag
++                if retire_state.mailbox.read_slot(scope_slot) != expected_version:
++                    valid_sampled_token_ids[req_index] = []
++                    prompt_logprobs_dict.pop(req_id, None)
++                    retire_rejected_request_ids.add(req_id)
++                    rejected += 1
++            if rejected:
++                retire_state.counters[2].add_(rejected)
++            retire_state.finish_step()
+         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
+             output = ModelRunnerOutput(
+                 req_ids=req_ids_output_copy,
+@@ -3312,6 +3399,7 @@ class GPUModelRunner(
+                 else None,
+                 num_nans_in_logits=num_nans_in_logits,
+                 cudagraph_stats=cudagraph_stats,
++                retire_rejected_request_ids=retire_rejected_request_ids,
+             )
+
+         if not self.use_async_scheduling:
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 1e13650..22ac5af 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -277,6 +277,17 @@ class Worker(WorkerBase):
+
+             self.model_runner = GPUModelRunnerV1(self.vllm_config, self.device)
+
++        # Opt-in only. The relay observes mmap changes independently of the
++        # EngineCore work queue and mirrors packed versions to device memory.
++        if os.environ.get("RETIRE_EPOCH_MAILBOX_PATH"):
++            from retire_serving.epoch_mailbox import (
++                layer_safe_point_horizon,
++                start_worker_epoch_relay,
++            )
++
++            if layer_safe_point_horizon() > 0:
++                start_worker_epoch_relay(self.device)
++
+         if self.rank == 0:
+             # If usage stat is enabled, collect relevant info.
+             report_usage_stats(self.vllm_config)
+@@ -418,6 +429,338 @@ class Worker(WorkerBase):
+         else:
+             self.model_runner.initialize_kv_cache(kv_cache_config)
+
++    def retire_fence_ack(self, safe_point_sequence: int) -> dict[str, Any]:
++        """Acknowledge that this worker has no pending KV writer.
++
++        EngineCore calls this collectively only after the preceding model
++        executor future has completed. Synchronizing the current CUDA stream
++        also closes asynchronous kernel completion before the receipt returns.
++        """
++        torch.cuda.current_stream(self.device).synchronize()
++        return {
++            "rank": self.rank,
++            "tensor_parallel_rank": get_tp_group().rank_in_group,
++            "pipeline_parallel_rank": get_pp_group().rank_in_group,
++            "writer_drained": True,
++            "safe_point_sequence": safe_point_sequence,
++        }
++
++    def retire_epoch_audit(self) -> dict[str, int]:
++        from retire_serving.epoch_mailbox import worker_epoch_audit
++
++        receipt = worker_epoch_audit()
++        return {
++            "rank": self.rank,
++            "tensor_parallel_rank": get_tp_group().rank_in_group,
++            **receipt,
++        }
++
++    def retire_epoch_admission(
++        self, scope_slot: int, expected_version: int
++    ) -> dict[str, int | bool]:
++        from retire_serving.epoch_mailbox import worker_wait_for_version
++
++        return worker_wait_for_version(scope_slot, expected_version)
++
++    def retire_epoch_admission_batch(
++        self, authorities: list[tuple[int, int]]
++    ) -> list[dict[str, int | bool]]:
++        from retire_serving.epoch_mailbox import worker_wait_for_versions
++
++        return worker_wait_for_versions(authorities)
++
++    def _retire_cache_slices(
++        self, group_block_ids: list[list[int]]
++    ) -> list[dict[str, Any]]:
++        """Resolve logical block IDs to per-layer physical cache slices."""
++        runner = self.model_runner
++        groups = runner.kv_cache_config.kv_cache_groups
++        if len(groups) != len(group_block_ids):
++            raise ValueError("RETIRE KV group topology changed during transfer")
++        resolved = []
++        seen = set()
++        context = runner.compilation_config.static_forward_context
++        num_blocks = runner.kv_cache_config.num_blocks
++        for group_id, (group, block_ids) in enumerate(
++            zip(groups, group_block_ids, strict=True)
++        ):
++            for layer_name in group.layer_names:
++                layer = context.get(layer_name)
++                if layer is None or not getattr(layer, "kv_cache", None):
++                    continue
++                cache = layer.kv_cache[0]
++                if not isinstance(cache, torch.Tensor):
++                    raise TypeError("RETIRE supports tensor KV caches only")
++                identity = (cache.data_ptr(), cache.storage_offset())
++                if identity in seen:
++                    continue
++                seen.add(identity)
++                exact_axes = [
++                    axis for axis, size in enumerate(cache.shape) if size == num_blocks
++                ]
++                if len(exact_axes) == 1:
++                    block_axis = exact_axes[0]
++                    split = 1
++                else:
++                    split_axes = [
++                        (axis, size // num_blocks)
++                        for axis, size in enumerate(cache.shape)
++                        if size > num_blocks and size % num_blocks == 0
++                    ]
++                    if len(split_axes) != 1:
++                        raise RuntimeError(
++                            f"RETIRE cannot identify block axis for {layer_name}: "
++                            f"shape={tuple(cache.shape)}, num_blocks={num_blocks}"
++                        )
++                    block_axis, split = split_axes[0]
++                physical_ids = [
++                    physical
++                    for block_id in block_ids
++                    for physical in range(block_id * split, (block_id + 1) * split)
++                ]
++                resolved.append(
++                    {
++                        "group_id": group_id,
++                        "layer_name": layer_name,
++                        "cache": cache,
++                        "block_axis": block_axis,
++                        "physical_ids": physical_ids,
++                    }
++                )
++        return resolved
++
++    def retire_digest_blocks(
++        self, group_block_ids: list[list[int]]
++    ) -> dict[str, Any]:
++        """Hash selected physical KV pages after draining the model stream."""
++        import hashlib
++
++        torch.cuda.current_stream(self.device).synchronize()
++        digest = hashlib.sha256()
++        digested_bytes = 0
++        with torch.no_grad():
++            for item in self._retire_cache_slices(group_block_ids):
++                cache = item["cache"]
++                ids = torch.tensor(
++                    item["physical_ids"], dtype=torch.long, device=cache.device
++                )
++                selected = torch.index_select(
++                    cache, item["block_axis"], ids
++                ).contiguous().cpu()
++                raw = memoryview(selected.view(torch.uint8).numpy())
++                digest.update(item["layer_name"].encode())
++                digest.update(hashlib.sha256(raw).digest())
++                digested_bytes += raw.nbytes
++        return {
++            "tensor_parallel_rank": get_tp_group().rank_in_group,
++            "pipeline_parallel_rank": get_pp_group().rank_in_group,
++            "kv_sha256": digest.hexdigest(),
++            "digested_bytes": digested_bytes,
++        }
++
++    def retire_offload_blocks(
++        self,
++        pin_key: str,
++        group_block_ids: list[list[int]],
++        codec: str,
++        destructive: bool = True,
++    ) -> dict[str, Any]:
++        """Copy pinned physical KV pages to worker-local host DRAM."""
++        import os
++        import hashlib
++        import time
++        import zlib
++        from concurrent.futures import ThreadPoolExecutor
++
++        if codec not in ("identity", "zlib"):
++            raise ValueError(f"unknown RETIRE codec: {codec}")
++        stores = getattr(self, "_retire_dram_stores", None)
++        if stores is None:
++            stores = self._retire_dram_stores = {}
++        if pin_key in stores:
++            raise ValueError(f"RETIRE DRAM object already exists: {pin_key}")
++        started = time.perf_counter_ns()
++        entries = []
++        encoded_hasher = hashlib.sha256()
++        decoded_hasher = hashlib.sha256()
++        raw_bytes = 0
++        encoded_bytes = 0
++        stream = torch.cuda.current_stream(self.device)
++        with torch.no_grad():
++            for item in self._retire_cache_slices(group_block_ids):
++                cache = item["cache"]
++                ids = torch.tensor(
++                    item["physical_ids"], dtype=torch.long, device=cache.device
++                )
++                selected = torch.index_select(
++                    cache, item["block_axis"], ids
++                ).contiguous()
++                cpu = torch.empty_like(
++                    selected, device="cpu", pin_memory=True
++                )
++                cpu.copy_(selected, non_blocking=True)
++                entries.append(
++                    {
++                        "group_id": item["group_id"],
++                        "layer_name": item["layer_name"],
++                        "block_axis": item["block_axis"],
++                        "physical_ids": item["physical_ids"],
++                        "shape": tuple(cpu.shape),
++                        "dtype": cpu.dtype,
++                        "cpu": cpu,
++                    }
++                )
++                if destructive:
++                    cache.index_fill_(item["block_axis"], ids, 0)
++        stream.synchronize()
++
++        def encode(
++            entry: dict[str, Any],
++        ) -> tuple[bytes | None, str, bytes, int]:
++            raw = memoryview(entry["cpu"].view(torch.uint8).numpy())
++            decoded_digest = hashlib.sha256(raw).digest()
++            encoded = zlib.compress(raw, level=1) if codec == "zlib" else None
++            encoded_digest = (
++                hashlib.sha256(encoded).digest()
++                if codec == "zlib"
++                else decoded_digest
++            )
++            return encoded, decoded_digest.hex(), encoded_digest, raw.nbytes
++
++        workers = min(len(entries), 16, max(1, os.cpu_count() or 1))
++        with ThreadPoolExecutor(max_workers=workers) as executor:
++            encoded_values = list(executor.map(encode, entries))
++        for entry, encoded_value in zip(entries, encoded_values, strict=True):
++            encoded, decoded_sha256, encoded_digest, raw_size = encoded_value
++            if codec == "zlib":
++                entry.pop("cpu")
++            entry["decoded_sha256"] = decoded_sha256
++            encoded_hasher.update(entry["layer_name"].encode())
++            encoded_hasher.update(encoded_digest)
++            decoded_hasher.update(entry["layer_name"].encode())
++            decoded_hasher.update(bytes.fromhex(decoded_sha256))
++            raw_bytes += raw_size
++            encoded_bytes += raw_size if encoded is None else len(encoded)
++            entry["encoded"] = encoded
++        stores[pin_key] = {"codec": codec, "entries": entries}
++        return {
++            "tensor_parallel_rank": get_tp_group().rank_in_group,
++            "pipeline_parallel_rank": get_pp_group().rank_in_group,
++            "operation_drained": True,
++            "encoded_sha256": encoded_hasher.hexdigest(),
++            "decoded_sha256": decoded_hasher.hexdigest(),
++            "raw_bytes": raw_bytes,
++            "encoded_bytes": encoded_bytes,
++            "offload_ms": (time.perf_counter_ns() - started) / 1e6,
++            "destructive": destructive,
++        }
++
++    def retire_restore_blocks(
++        self, pin_key: str, group_block_ids: list[list[int]]
++    ) -> dict[str, Any]:
++        """Decode worker-local DRAM pages back into their pinned GPU slots."""
++        import os
++        import hashlib
++        import time
++        import zlib
++        from concurrent.futures import ThreadPoolExecutor
++
++        stores = getattr(self, "_retire_dram_stores", {})
++        store = stores.get(pin_key)
++        if store is None:
++            raise KeyError(f"unknown RETIRE DRAM object: {pin_key}")
++        targets = self._retire_cache_slices(group_block_ids)
++        entries = store["entries"]
++        if len(entries) != len(targets):
++            raise RuntimeError("RETIRE DRAM object does not match active KV layers")
++        started = time.perf_counter_ns()
++        restored = 0
++        remapped_blocks = 0
++        integrity_verified = True
++
++        def decode(entry: dict[str, Any]) -> tuple[Any, bool]:
++            encoded = entry["encoded"]
++            if store["codec"] == "identity":
++                cpu = entry["cpu"]
++                raw = memoryview(cpu.view(torch.uint8).numpy())
++                return (
++                    cpu,
++                    hashlib.sha256(raw).hexdigest()
++                    == entry["decoded_sha256"],
++                )
++            raw = zlib.decompress(encoded)
++            return (
++                raw,
++                hashlib.sha256(raw).hexdigest() == entry["decoded_sha256"],
++            )
++
++        workers = min(len(entries), 16, max(1, os.cpu_count() or 1))
++        with ThreadPoolExecutor(max_workers=workers) as executor:
++            decoded_entries = list(executor.map(decode, entries))
++        with torch.no_grad():
++            for item, target, (decoded, verified) in zip(
++                entries, targets, decoded_entries, strict=True
++            ):
++                integrity_verified &= verified
++                source = (
++                    decoded
++                    if store["codec"] == "identity"
++                    else torch.frombuffer(
++                        bytearray(decoded), dtype=item["dtype"]
++                    ).reshape(item["shape"])
++                )
++                if all(
++                    physical in item["physical_ids"]
++                    for physical in target["physical_ids"]
++                ):
++                    positions = [
++                        item["physical_ids"].index(physical)
++                        for physical in target["physical_ids"]
++                    ]
++                else:
++                    # Capacity-reclaiming offload deliberately releases the
++                    # old slots.  Fresh block IDs preserve prefix order, not
++                    # physical identity with the source allocation.
++                    positions = list(range(len(target["physical_ids"])))
++                    remapped_blocks += len(positions)
++                if positions == list(range(len(positions))):
++                    source = source.narrow(
++                        item["block_axis"], 0, len(positions)
++                    )
++                else:
++                    position_tensor = torch.tensor(
++                        positions, dtype=torch.long
++                    )
++                    source = torch.index_select(
++                        source, item["block_axis"], position_tensor
++                    )
++                if not source.is_pinned():
++                    source = source.pin_memory()
++                cache = target["cache"]
++                ids = torch.tensor(
++                    target["physical_ids"], dtype=torch.long, device=cache.device
++                )
++                cache.index_copy_(
++                    target["block_axis"],
++                    ids,
++                    source.to(cache.device, non_blocking=True),
++                )
++                restored += source.numel() * source.element_size()
++        torch.cuda.current_stream(self.device).synchronize()
++        return {
++            "tensor_parallel_rank": get_tp_group().rank_in_group,
++            "pipeline_parallel_rank": get_pp_group().rank_in_group,
++            "operation_drained": True,
++            "integrity_verified": integrity_verified,
++            "restored_bytes": restored,
++            "remapped_blocks": remapped_blocks,
++            "restore_ms": (time.perf_counter_ns() - started) / 1e6,
++        }
++
++    def retire_drop_dram(self, pin_key: str) -> bool:
++        """Drop one worker-local encoded DRAM object after reclaim."""
++        return getattr(self, "_retire_dram_stores", {}).pop(pin_key, None) is not None
++
+     def compile_or_warm_up_model(self) -> None:
+         warmup_sizes = []
+

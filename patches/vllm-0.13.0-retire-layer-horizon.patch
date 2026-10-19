@@ -1,0 +1,60 @@
+diff --git a/vllm/model_executor/models/qwen2.py b/vllm/model_executor/models/qwen2.py
+index f4c2d3cb7..41bfffd65 100644
+--- a/vllm/model_executor/models/qwen2.py
++++ b/vllm/model_executor/models/qwen2.py
+@@ -28,5 +28,6 @@
+ from collections.abc import Iterable
+ from itertools import islice
+ from typing import Any
+-
++import os
++
+ import torch
+@@ -436,7 +437,22 @@ class Qwen2Model(nn.Module):
+         aux_hidden_states = []
++        retire_layer_plan = None
++        if (
++            os.environ.get("RETIRE_LAYER_HORIZON")
++            and not self.aux_hidden_state_layers
++        ):
++            from retire_serving.epoch_mailbox import worker_layer_safe_point_plan
++
++            retire_layer_plan = worker_layer_safe_point_plan()
+         for idx, layer in enumerate(
+             islice(self.layers, self.start_layer, self.end_layer)
+         ):
++            if (
++                retire_layer_plan is not None
++                and idx > 0
++                and idx % retire_layer_plan[0] == 0
++            ):
++                if retire_layer_plan[1]():
++                    break
+             if idx in self.aux_hidden_state_layers:
+                 aux_hidden_states.append(hidden_states + residual)
+             hidden_states, residual = layer(positions, hidden_states, residual)
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index d8b2af456..e62819902 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -1530,4 +1530,2 @@ class GPUModelRunner(
+         """Attach per-request authority to Triton metadata when configured."""
+-        if not scheduler_output.retire_request_tags:
+-            return
+         from retire_serving.epoch_mailbox import get_worker_epoch_state
+@@ -1538,4 +1536,15 @@ class GPUModelRunner(
+         state = get_worker_epoch_state()
++        if state is not None:
++            state.bind_step_authority(
++                req_ids,
++                scheduler_output.retire_request_tags,
++                scheduler_output.scheduled_spec_decode_tokens,
++                int(num_scheduled_tokens.sum()),
++            )
++        if not scheduler_output.retire_request_tags:
++            return
+         if state is None:
+             raise RuntimeError("RETIRE tags arrived without a worker epoch relay")
++        if not state.step_requires_device_predicates:
++            return
+         if isinstance(attn_metadata, list):
